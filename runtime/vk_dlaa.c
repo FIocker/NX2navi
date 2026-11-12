@@ -480,6 +480,9 @@ static struct {
         VmaAllocation dist_mem[2];
         VkImageView dist_view[2];
         int dist_cur, dist_ok;   // as chars_cur and chars_ok
+        VkImage sharp;           // RCAS's result at the output size, made when sharpening is first asked (sharpen)
+        VmaAllocation sharp_mem;
+        VkImageView sharp_view;
         NgxHandle *feat;
         uint64_t used;           // evals count when it last ran
     } sizes[DLSS_SIZES], *last;  // last: the one the previous DLAA frame ran with
@@ -698,6 +701,8 @@ static void destroy_size(struct Size *e) {
         if (e->dist_view[i]) vkDestroyImageView(c->device, e->dist_view[i], NULL);
         if (e->dist[i]) vmaDestroyImage(c->vma, e->dist[i], e->dist_mem[i]);
     }
+    if (e->sharp_view) vkDestroyImageView(c->device, e->sharp_view, NULL);
+    if (e->sharp) vmaDestroyImage(c->vma, e->sharp, e->sharp_mem);
     if (e->feat && N.release) N.release(e->feat), feat_released = 1;
     memset(e, 0, sizeof *e);
 }
@@ -1747,6 +1752,7 @@ static void window_line(void) {
 
 // dst: the target DLSS's picture goes to, NULL for the light target itself (DLAA in place).
 static void hudless(VkCommandBuffer cb, struct Size *e, uint32_t w, uint32_t h);
+static void sharpen(VkCommandBuffer cb, struct Size *e, uint32_t ow, uint32_t oh);
 
 // Another light target than last frame's. The game draws its scene into one of a few pooled targets of the same size
 // and moves to another whenever its pass list changes, in the middle of play with the camera and the scene carrying
@@ -1999,6 +2005,7 @@ evaluated:
     stale_sizes(e);
     full_barrier(cb);
     vk_mvcheck_output(cb, e->out, ow, oh);   // NX2NAVI_MV_CHECK (test)
+    if (!fsr) sharpen(cb, e, ow, oh);   // FSR 3.1 sharpened with its own RCAS (vk_ffx.cpp)
     // the result into the scene target (DLAA: the bloom, the post passes and the HUD read it and draw over it) or into
     // the scaling pass's target (the HUD draws over it)
     VkImageBlit b = {.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
@@ -2042,6 +2049,49 @@ evaluated:
                (unsigned long long)D.cam_none_draw, (unsigned long long)D.cam_none_snap, (unsigned long long)D.cam_kept,
                (unsigned long long)D.cam_kept_max, KEEP_MAX, (unsigned long long)D.cam_at_draw);
     window_line();
+}
+
+// Sharpening of DLSS's picture (NX2NAVI_DLSS_SHARPNESS, 0..100, 0 = none; the menu's Sharpness row with DLSS): the
+// models DLSS runs now ignore its own Sharpness parameter, and the present's FSR sharpening never sees this picture
+// (it runs only where the window is larger than the game's output, and FSR's RCAS lives inside FSR 3.1 and FSR 4).
+// RCAS (vk_fsr.c vk_fsr_sharpen) reads the output and writes e->sharp, which is copied back: the blit below, the scaling
+// draw and the HUD-less picture all read e->out. It runs on the scene's light before the post passes and the HUD, where
+// FSR 3.1 and FSR 4 sharpen too, so the HUD and the text are never sharpened. One RCAS pass and one copy at the output
+// size; nothing at 0.
+static void sharpen(VkCommandBuffer cb, struct Size *e, uint32_t ow, uint32_t oh) {
+    int sharp = cfg_int("NX2NAVI_DLSS_SHARPNESS");
+    if (sharp <= 0) return;
+    static int failed, told;
+    if (!e->sharp && !failed) {
+        if (!image2d(ow, oh, VK_FORMAT_R16G16B16A16_SFLOAT, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+                     &e->sharp, &e->sharp_mem, &e->sharp_view)) {
+            const VkCtx *c = vk_ctx();
+            if (e->sharp_view) vkDestroyImageView(c->device, e->sharp_view, NULL);
+            if (e->sharp) vmaDestroyImage(c->vma, e->sharp, e->sharp_mem);
+            e->sharp = VK_NULL_HANDLE, e->sharp_view = VK_NULL_HANDLE;
+            failed = 1;
+            rt_log("dlaa: the sharpening image could not be made: DLSS's picture is not sharpened in this run");
+            return;
+        }
+        VkImageMemoryBarrier2 ib = {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+                                    .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                                    .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                                    .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT,
+                                    .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+                                    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                                    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .image = e->sharp,
+                                    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+        VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .imageMemoryBarrierCount = 1,
+                               .pImageMemoryBarriers = &ib};
+        vkCmdPipelineBarrier2(cb, &di);
+    }
+    if (!e->sharp || !vk_fsr_sharpen(cb, e->out_view, e->sharp_view, ow, oh, sharp)) return;
+    full_barrier(cb);
+    VkImageCopy copy = {.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                        .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .extent = {ow, oh, 1}};
+    vkCmdCopyImage(cb, e->sharp, VK_IMAGE_LAYOUT_GENERAL, e->out, VK_IMAGE_LAYOUT_GENERAL, 1, &copy);
+    full_barrier(cb);
+    if (!told++) rt_log("dlaa: DLSS's %ux%u picture sharpened by RCAS (sharpness %d)", ow, oh, sharp);
 }
 
 // The HUD-less picture (vk_dlaa_fg_hudless): DLSS's output, which the HUD is then drawn over, through the encode the

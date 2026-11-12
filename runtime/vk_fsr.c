@@ -23,6 +23,7 @@
 #include "fsr_easu_spv.h"
 #include "fsr_rcas_spv.h"
 #include "host.h"
+#include "platform/platform.h"
 
 #define SLOTS 8
 
@@ -56,7 +57,6 @@ static VkPipeline make_pipeline(VkCtx *c, const uint32_t *code, size_t size) {
 }
 
 static int init(VkCtx *c) {
-    F.tried = 1;
     F.push = (PFN_vkCmdPushDescriptorSetKHR)vk_dpa(c->device, "vkCmdPushDescriptorSetKHR");
     if (!F.push) {
         rt_log("vk: FSR off: no VK_KHR_push_descriptor; the present scales bilinearly");
@@ -88,6 +88,17 @@ static int init(VkCtx *c) {
     }
     rt_log("vk: FSR 1 (EASU + RCAS) ready for the present");
     return F.ok = 1;
+}
+
+// The pipelines, made once by whichever of the present (vk_fsr_record) and the replay (vk_fsr_sharpen) comes first.
+static int ready(VkCtx *c) {
+    static PlatMutex once = PLAT_MUTEX_INIT;
+    if (!__atomic_load_n(&F.tried, __ATOMIC_ACQUIRE)) {
+        plat_mutex_lock(&once);
+        if (!F.tried) init(c), __atomic_store_n(&F.tried, 1, __ATOMIC_RELEASE);   // F.ok is set before tried
+        plat_mutex_unlock(&once);
+    }
+    return F.ok;
 }
 
 static void free_images(VkCtx *c) {
@@ -211,8 +222,7 @@ int vk_fsr_record(VkCommandBuffer cb, unsigned slot, VkImage src, VkFormat fmt, 
     int shrink = dw < (uint32_t)cw || dh < (uint32_t)ch;
     if (shrink && !sharp) return 0;
     VkCtx *c = vk_ctx();
-    if (!F.tried) init(c);
-    if (!F.ok || !ensure_images(c, dw, dh)) return 0;
+    if (!ready(c) || !ensure_images(c, dw, dh)) return 0;
     if (shrink) return shrink_sharpen(cb, src, crop, dst, out, sharp);
     slot %= SLOTS;
     if (F.src_view[slot]) vkDestroyImageView(c->device, F.src_view[slot], NULL);
@@ -260,6 +270,19 @@ int vk_fsr_record(VkCommandBuffer cb, unsigned slot, VkImage src, VkFormat fmt, 
                           .dstOffsets = {{out[0], out[1], 0}, {out[0] + (int)dw, out[1] + (int)dh, 1}}};
     vkCmdBlitImage(cb, F.img[last], VK_IMAGE_LAYOUT_GENERAL, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region,
                    VK_FILTER_NEAREST);
+    return 1;
+}
+
+// RCAS alone over the temporal upscaler's picture (vk_dlaa.c evaluate: DLSS and DLAA, whose current models no longer
+// sharpen), before the game's post passes and HUD. The present's FSR path has no part in it: the upscaler's picture is
+// already at the output size, so there is nothing for EASU to do. The pipelines are the present's; the first caller
+// makes them (ready).
+int vk_fsr_sharpen(VkCommandBuffer cb, VkImageView in, VkImageView out, uint32_t w, uint32_t h, int sharp) {
+    if (sharp <= 0 || !ready(vk_ctx())) return 0;
+    if (sharp > 100) sharp = 100;
+    float rcas[8] = {(float)w, (float)h, (float)(100 - sharp) / 50.0f, 0, 0, 0, 0, 0};
+    bind_pass(cb, F.rcas, in, out, rcas);
+    vkCmdDispatch(cb, (w + 15) / 16, (h + 15) / 16, 1);
     return 1;
 }
 

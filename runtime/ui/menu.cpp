@@ -1286,10 +1286,15 @@ static void tab_screen(float scale) {
     row_framegen();
     row_hdr();
     // The sharpening runs under FSR 1 (vk_fsr.c vk_fsr_record, RCAS) and FSR 3.1 (vk_ffx.cpp, its own RCAS); with
-    // bilinear or DLSS the slider would do nothing
+    // bilinear the slider would do nothing. With DLSS the row is DLSS's own sharpness (vk_dlaa.c sharpen, RCAS over
+    // DLSS's picture), a setting of its own that starts at 0, so DLSS looks as before until it is raised
     int dl = cfg_bool("NX2NAVI_DLAA"), fsr3 = dl && !strcmp(cfg_value("NX2NAVI_TAA"), "fsr3") && vk_ffx_available();
-    if (!fsr3 && (strcmp(cfg_value("NX2NAVI_UPSCALER"), "fsr") || dl)) opt_disable_next(UI_MENU_SHARPNESS_NEEDS_FSR);
-    opt_slider("NX2NAVI_SHARPNESS", UI_MENU_SHARPNESS, 0, 100, UI_MENU_SHARPNESS_DESC, 5, "%.0f %%");
+    if (dl && !fsr3)
+        opt_slider("NX2NAVI_DLSS_SHARPNESS", UI_MENU_DLSS_SHARPNESS, 0, 100, UI_MENU_DLSS_SHARPNESS_DESC, 5, "%.0f %%");
+    else {
+        if (!fsr3 && strcmp(cfg_value("NX2NAVI_UPSCALER"), "fsr")) opt_disable_next(UI_MENU_SHARPNESS_NEEDS_FSR);
+        opt_slider("NX2NAVI_SHARPNESS", UI_MENU_SHARPNESS, 0, 100, UI_MENU_SHARPNESS_DESC, 5, "%.0f %%");
+    }
     // Anisotropic filtering of the surface textures that tile (vk_texture.c aniso_raised), at once (vk_sampler_aniso_live)
     static const char *const aniso[] = {"game", "2", "4", "8", "16"};
     const char *aniso_names[] = {menu_text(UI_MENU_ANISO_GAME), "2x", "4x", "8x", "16x"};

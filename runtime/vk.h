@@ -182,6 +182,10 @@ void vk_present_blit(VkImage src, VkImageLayout layout, VkFormat fmt, int w, int
 int vk_fsr_record(VkCommandBuffer cb, unsigned slot, VkImage src, VkFormat fmt, int sw, int sh, const int crop[4],
                   VkImage dst, const int out[4]);
 void vk_fsr_release(void);   // before the device goes away
+// RCAS of in (sampled, GENERAL) into out (storage RGBA16F, GENERAL), both w x h, at sharpness 1..100 (vk_fsr.c, for
+// vk_dlaa.c's DLSS picture); 0 = nothing recorded (sharp 0, or FSR's pipelines are not there). The caller orders the
+// writes before and the reads after it.
+int vk_fsr_sharpen(VkCommandBuffer cb, VkImageView in, VkImageView out, uint32_t w, uint32_t h, int sharp);
 // Colour adjustment on the present (vk_color.c): with NX2NAVI_COLOR_* away from their defaults, records a pass that writes
 // src's crop rectangle {x, y, w, h}, adjusted, into an RGBA16F image of that size in GENERAL and returns it (the caller
 // scales that one instead, crop {0, 0, w, h}); VK_NULL_HANDLE = nothing recorded. src is in GENERAL, fmt its format.
